@@ -101,17 +101,8 @@ git add "repak-x/*.js"
 git add "repak-x/*.json"
 git add "repak-x/*.html"
 
-# Check if there are staged changes
-$staged = git diff --cached --name-status
-if (-not $staged) {
-    Write-Host "`nNo frontend files to commit." -ForegroundColor Yellow
-    exit 0
-}
-
-# Ask if user wants to add extra files
-Write-Host ""
-$addExtra = Read-Host "Add extra files to this commit? (y/N)"
-if ($addExtra -eq "y" -or $addExtra -eq "Y") {
+# Prompt for file paths and stage each one that exists
+function Add-ExtraFiles {
     Write-Host "`nEnter file paths to add (one per line, empty line to finish):" -ForegroundColor Cyan
     $extraFiles = @()
     while ($true) {
@@ -121,7 +112,7 @@ if ($addExtra -eq "y" -or $addExtra -eq "Y") {
         }
         $extraFiles += $file
     }
-    
+
     if ($extraFiles.Count -gt 0) {
         Write-Host "`nAdding extra files..." -ForegroundColor Cyan
         foreach ($file in $extraFiles) {
@@ -135,13 +126,35 @@ if ($addExtra -eq "y" -or $addExtra -eq "Y") {
     }
 }
 
+# Check if there are staged changes
+$staged = git diff --cached --name-status
+if (-not $staged) {
+    # Nothing matched the frontend paths: ask which files to commit instead of quitting
+    Write-Host "`nNo frontend files to commit." -ForegroundColor Yellow
+    Add-ExtraFiles
+
+    $staged = git diff --cached --name-status
+    if (-not $staged) {
+        Write-Host "`nNothing staged. Aborted." -ForegroundColor Yellow
+        exit 0
+    }
+}
+else {
+    # Ask if user wants to add extra files
+    Write-Host ""
+    $addExtra = Read-Host "Add extra files to this commit? (y/N)"
+    if ($addExtra -eq "y" -or $addExtra -eq "Y") {
+        Add-ExtraFiles
+    }
+}
+
 Write-Host "`nFiles to commit:" -ForegroundColor Green
 # Show with colored status indicators
 git diff --cached --name-status | ForEach-Object {
     $parts = $_ -split "`t"
     $status = $parts[0]
     $file = $parts[1]
-    
+
     switch ($status) {
         "A" { Write-Host "  [+] $file" -ForegroundColor Green }      # Added
         "M" { Write-Host "  [~] $file" -ForegroundColor Yellow }     # Modified
@@ -163,12 +176,14 @@ if ($confirm -eq "n" -or $confirm -eq "N") {
 # Commit (prepend [run-ci] if this is a release)
 if ($versionResult.RunCI) {
     $Message = "[run-ci] $Message"
+} elseif ($versionResult.DryCI) {
+    $Message = "[dry-ci] $Message"
 }
 Write-Host "`nCommitting..." -ForegroundColor Cyan
 git commit -m $Message
 
 # Push
-Write-Host "`nPushing to remote..." -ForegroundColor Cyan
-git push
+Write-Host "`nPushing to remote main..." -ForegroundColor Cyan
+git push origin main
 
 Write-Host "`n=== Done! ===" -ForegroundColor Green

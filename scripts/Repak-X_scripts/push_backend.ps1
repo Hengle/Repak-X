@@ -64,6 +64,8 @@ if (-not $status) {
 # 7. Commit (prepend [run-ci] if this is a release)
 if ($versionResult.RunCI) {
     $Message = "[run-ci] $Message"
+} elseif ($versionResult.DryCI) {
+    $Message = "[dry-ci] $Message"
 }
 Write-Host "Committing: $Message" -ForegroundColor Green
 git commit -m "$Message"

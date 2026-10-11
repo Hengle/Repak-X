@@ -8,7 +8,13 @@ function Invoke-VersionBump {
     
     # Ask about [run-ci]
     Write-Host ""
-    $runCI = Read-Host "Is this a [run-ci] release commit? (Y/n)"
+    $runCI = Read-Host "Is this a [run-ci] release commit? (Y = release / d = dry CI build only / n)"
+    
+    # Dry run: CI builds and packages every platform but publishes nothing, so no version bump
+    if ($runCI -eq "D" -or $runCI -eq "d") {
+        Write-Host "Dry CI run: commit message will be prefixed with [dry-ci]" -ForegroundColor Green
+        return @{ RunCI = $false; DryCI = $true; Version = $null }
+    }
     
     if ($runCI -ne "Y" -and $runCI -ne "y" -and $runCI -ne "") {
         return @{ RunCI = $false; Version = $null }

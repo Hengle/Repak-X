@@ -7,20 +7,29 @@ on:
   push:
     branches:
       - main  # Triggers on push to main branch
-    # The job will only run if the commit message contains the keyword '[run-ci]'
+    # The jobs only run if the commit message contains a keyword:
+    #   [run-ci]  build every platform, then tag + publish the GitHub release
+    #   [dry-ci]  build and package every platform only - no tag, release or Discord post
   workflow_dispatch:  # Allows manual trigger from GitHub Actions tab
+    inputs:
+      release:
+        description: 'Publish a GitHub release (untick for a build-only dry run)'
+        type: boolean
+        default: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   # ============================================================================
-  # BUILD JOB - Builds the Windows release (Linux dropped for now; AOT-on-Linux is separate)
+  # BUILD JOB - Builds and packages the Windows and Linux releases
   # ============================================================================
   build:
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && contains(github.event.head_commit.message, '[run-ci]'))
+      (github.event_name == 'push' &&
+        (contains(github.event.head_commit.message, '[run-ci]') ||
+         contains(github.event.head_commit.message, '[dry-ci]')))
     
     strategy:
       fail-fast: false
@@ -32,8 +41,14 @@ jobs:
             artifact_name: Repak-X-Windows
             artifact_ext: .zip
             sccache_path: C:\Users\runneradmin\.cache\sccache
-          # Linux intentionally dropped for now — AOT on Linux (toolchain, .so naming,
-          # Oodle) is handled separately. Re-add an ubuntu entry when that lands.
+          # 22.04 rather than latest: the binary then only needs glibc 2.35, so it runs
+          # on older distros too. It is the oldest runner that ships webkit2gtk-4.1.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            dotnet_rid: linux-x64
+            artifact_name: Repak-X-Linux
+            artifact_ext: .tar.gz
+            sccache_path: /home/runner/.cache/sccache
     
     runs-on: ${{ matrix.os }}
     
@@ -54,6 +69,17 @@ jobs:
           submodules: recursive
 
       # ========== Setup Tools ==========
+      # Tauri needs the GTK/WebKit dev packages; NativeAOT links with clang and zlib.
+      - name: Install Linux Build Dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config curl wget file \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libssl-dev libxdo-dev \
+            clang zlib1g-dev
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -177,7 +203,6 @@ jobs:
           
           # Create directories
           New-Item -ItemType Directory -Force -Path $packageDir
-          New-Item -ItemType Directory -Force -Path "$packageDir/data"
           
           # Copy main executable
           Copy-Item "target/${{ matrix.target }}/release/REPAK-X.exe" "$packageDir/"
@@ -186,9 +211,6 @@ jobs:
           Copy-Item "target/uassettool/*" "$packageDir/" -Recurse
           if (Test-Path "$packageDir/*.pdb") { Remove-Item "$packageDir/*.pdb" }
           if (Test-Path "$packageDir/UAssetTool.exe") { Remove-Item "$packageDir/UAssetTool.exe" }
-          
-          # Copy data files
-          Copy-Item "repak-x/src/data/character_data.json" "$packageDir/data/"
           
           # Create ZIP
           $zipPath = "$distDir/Repak-X-v$version-Windows.zip"
@@ -199,12 +221,48 @@ jobs:
           
           echo "ARTIFACT_PATH=$zipPath" >> $env:GITHUB_OUTPUT
 
+      # ========== Package - Linux ==========
+      - name: Package Linux Distribution
+        if: runner.os == 'Linux'
+        id: package_linux
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          DIST_DIR="dist"
+          PACKAGE_NAME="Repak-X-v$VERSION-Linux"
+          PACKAGE_DIR="$DIST_DIR/$PACKAGE_NAME"
+
+          mkdir -p "$PACKAGE_DIR"
+
+          # Copy main executable
+          cp "target/${{ matrix.target }}/release/REPAK-X" "$PACKAGE_DIR/"
+          chmod +x "$PACKAGE_DIR/REPAK-X"
+
+          # dotnet names the NativeAOT library after the assembly (UAssetTool.so); the
+          # app loads it as libUAssetTool.so from beside the executable.
+          cp "target/uassettool/UAssetTool.so" "$PACKAGE_DIR/libUAssetTool.so"
+
+          # Any other native libraries the publish produced (none today), minus debug files
+          find target/uassettool -maxdepth 1 -name '*.so' ! -name 'UAssetTool.so' \
+            -exec cp {} "$PACKAGE_DIR/" \;
+
+          # One top-level folder in the archive; the in-app updater unwraps it.
+          TAR_PATH="$DIST_DIR/$PACKAGE_NAME.tar.gz"
+          tar -czf "$TAR_PATH" -C "$DIST_DIR" "$PACKAGE_NAME"
+
+          echo "Linux tarball created: $(du -h "$TAR_PATH" | cut -f1)"
+          tar -tzf "$TAR_PATH"
+
+          echo "ARTIFACT_PATH=$TAR_PATH" >> "$GITHUB_OUTPUT"
+
       # ========== Upload Artifacts ==========
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}-v${{ steps.version.outputs.VERSION }}
-          path: ${{ steps.package_windows.outputs.ARTIFACT_PATH }}
+          path: ${{ steps.package_windows.outputs.ARTIFACT_PATH || steps.package_linux.outputs.ARTIFACT_PATH }}
+          if-no-files-found: error
           retention-days: 30
 
       - name: Stop sccache and show stats
@@ -219,6 +277,11 @@ jobs:
   # ============================================================================
   release:
     needs: build
+    # Skipped on a dry run ([dry-ci], or a manual run with "release" unticked): the
+    # build job above has already proven that every platform compiles and packages.
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.release) ||
+      (github.event_name == 'push' && contains(github.event.head_commit.message, '[run-ci]'))
     runs-on: ubuntu-latest
     
     steps:
@@ -228,11 +291,12 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Download Windows Artifact
+      - name: Download Build Artifacts
         uses: actions/download-artifact@v4
         with:
-          name: Repak-X-Windows-v${{ needs.build.outputs.version }}
+          pattern: Repak-X-*-v${{ needs.build.outputs.version }}
           path: dist/
+          merge-multiple: true
 
       - name: List Downloaded Artifacts
         run: |
@@ -284,6 +348,8 @@ jobs:
           body_path: ${{ steps.changelog.outputs.CHANGELOG_FILE }}
           files: |
             dist/Repak-X-v${{ needs.build.outputs.version }}-Windows.zip
+            dist/Repak-X-v${{ needs.build.outputs.version }}-Linux.tar.gz
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
