@@ -240,6 +240,16 @@ pub async fn extract_mod_assets(
         }
     }
 
+    // An empty result means the tool could not read the mod; continuing would only
+    // produce an empty output mod further down the pipeline.
+    if assets.is_empty() {
+        vfx_error(&format!("No assets extracted from mod: {}", response.message));
+        return Err(format!(
+            "[VFX] No assets could be extracted from the mod ({})",
+            response.message
+        ));
+    }
+
     // Sort to ensure deterministic order
     assets.sort();
     list_lines.sort();

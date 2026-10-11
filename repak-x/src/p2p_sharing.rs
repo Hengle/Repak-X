@@ -42,6 +42,9 @@ const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 /// Chunk size for file transfer (1MB)
 const CHUNK_SIZE: usize = 1024 * 1024;
 
+/// Sent to the receiver in a `P2PMessage::Error` when the sender stops sharing mid-transfer
+const HOST_STOPPED_MESSAGE: &str = "The sender stopped sharing";
+
 /// Protocol version for compatibility checking
 const PROTOCOL_VERSION: u32 = 1;
 
@@ -146,11 +149,31 @@ enum P2PMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferProgress {
     pub current_file: String,
+    pub mods_completed: usize,
+    pub total_mods: usize,
     pub files_completed: usize,
     pub total_files: usize,
     pub bytes_transferred: u64,
     pub total_bytes: u64,
     pub status: TransferStatus,
+}
+
+/// Progress info for the sending side of a share.
+/// The server handles one peer at a time, so a single tracker is enough.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UploadProgress {
+    /// A peer is currently connected and pulling files
+    pub active: bool,
+    pub peer_name: Option<String>,
+    pub current_file: String,
+    pub mods_completed: usize,
+    pub total_mods: usize,
+    pub files_completed: usize,
+    pub total_files: usize,
+    pub bytes_transferred: u64,
+    pub total_bytes: u64,
+    /// Number of peers that received the whole pack
+    pub completed_transfers: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -177,6 +200,8 @@ pub enum P2PError {
     ValidationError(String),
     ConnectionError(String),
     Cancelled,
+    /// The sender stopped sharing while we were connected
+    HostStopped,
 }
 
 impl std::fmt::Display for P2PError {
@@ -189,6 +214,7 @@ impl std::fmt::Display for P2PError {
             P2PError::ValidationError(msg) => write!(f, "Validation error: {}", msg),
             P2PError::ConnectionError(msg) => write!(f, "Connection error: {}", msg),
             P2PError::Cancelled => write!(f, "Operation cancelled"),
+            P2PError::HostStopped => write!(f, "{}", HOST_STOPPED_MESSAGE),
         }
     }
 }
@@ -467,6 +493,7 @@ pub struct P2PServer {
     encryption_key: [u8; 32],
     stop_flag: Arc<AtomicBool>,
     active_connections: Arc<Mutex<usize>>,
+    upload_progress: Arc<Mutex<UploadProgress>>,
 }
 
 impl P2PServer {
@@ -547,6 +574,15 @@ impl P2PServer {
             port, session.share_code
         );
 
+        let mut upload_progress = UploadProgress::default();
+        upload_progress.total_mods = mod_pack.mods.len();
+        for mod_info in &mod_pack.mods {
+            upload_progress.total_files += 1 + mod_info.iostore_files.len();
+            upload_progress.total_bytes += mod_info.size;
+            upload_progress.total_bytes +=
+                mod_info.iostore_files.iter().map(|f| f.size).sum::<u64>();
+        }
+
         Ok(Self {
             listener: Some(listener),
             session,
@@ -555,7 +591,13 @@ impl P2PServer {
             encryption_key,
             stop_flag: Arc::new(AtomicBool::new(false)),
             active_connections: Arc::new(Mutex::new(0)),
+            upload_progress: Arc::new(Mutex::new(upload_progress)),
         })
+    }
+
+    /// Get a shared handle to the upload progress tracker
+    pub fn upload_progress_handle(&self) -> Arc<Mutex<UploadProgress>> {
+        self.upload_progress.clone()
     }
 
     /// Get the current session info
@@ -635,7 +677,20 @@ impl P2PServer {
             *count += 1;
         }
 
+        // Fresh counters for this peer (a retry starts the pack over)
+        {
+            let mut progress = self.upload_progress.lock().unwrap();
+            progress.active = true;
+            progress.peer_name = None;
+            progress.current_file.clear();
+            progress.mods_completed = 0;
+            progress.files_completed = 0;
+            progress.bytes_transferred = 0;
+        }
+
         let result = self.handle_client_session(&mut stream);
+
+        self.upload_progress.lock().unwrap().active = false;
 
         // Decrement active connections
         {
@@ -676,6 +731,7 @@ impl P2PServer {
                 }
 
                 info!("Client connected: {:?}", client_name);
+                self.upload_progress.lock().unwrap().peer_name = client_name;
 
                 // Send welcome with pack info
                 let welcome = P2PMessage::Welcome {
@@ -716,6 +772,10 @@ impl P2PServer {
                 }
                 P2PMessage::Goodbye => {
                     info!("Client disconnected gracefully");
+                    let mut progress = self.upload_progress.lock().unwrap();
+                    if progress.files_completed >= progress.total_files {
+                        progress.completed_transfers += 1;
+                    }
                     break;
                 }
                 _ => {
@@ -747,8 +807,20 @@ impl P2PServer {
         let mut hasher = Sha256::new();
 
         info!("Sending file: {} ({} bytes)", filename, file_size);
+        self.upload_progress.lock().unwrap().current_file = filename.to_string();
 
         loop {
+            // Sharing was stopped mid-transfer: tell the receiver instead of
+            // leaving it waiting on a dead connection
+            if self.stop_flag.load(Ordering::SeqCst) {
+                info!("Share stopped while sending {} - notifying client", filename);
+                let error = P2PMessage::Error {
+                    message: HOST_STOPPED_MESSAGE.to_string(),
+                };
+                let _ = send_encrypted_message(stream, &self.encryption_key, &error);
+                return Err(P2PError::Cancelled);
+            }
+
             let bytes_read = reader
                 .read(&mut buffer)
                 .map_err(|e| P2PError::FileError(format!("Failed to read file: {}", e)))?;
@@ -775,6 +847,7 @@ impl P2PServer {
                 .map_err(|e| P2PError::ProtocolError(format!("Invalid ACK: {}", e)))?;
 
             offset += bytes_read as u64;
+            self.upload_progress.lock().unwrap().bytes_transferred += bytes_read as u64;
         }
 
         // Send transfer complete with hash
@@ -785,6 +858,24 @@ impl P2PServer {
         };
         send_encrypted_message(stream, &self.encryption_key, &complete)?;
 
+        {
+            let mut progress = self.upload_progress.lock().unwrap();
+            progress.files_completed += 1;
+            // Files are requested mod by mod (.pak, then its IoStore files),
+            // so whole mods sent follows from the running file count
+            let mut remaining = progress.files_completed;
+            progress.mods_completed = self
+                .mod_pack
+                .mods
+                .iter()
+                .take_while(|m| {
+                    let files = 1 + m.iostore_files.len();
+                    let done = remaining >= files;
+                    remaining = remaining.saturating_sub(files);
+                    done
+                })
+                .count();
+        }
         info!("File sent successfully: {}", filename);
         Ok(())
     }
@@ -811,6 +902,8 @@ impl P2PClient {
             stop_flag: Arc::new(AtomicBool::new(false)),
             progress: Arc::new(Mutex::new(TransferProgress {
                 current_file: String::new(),
+                mods_completed: 0,
+                total_mods: 0,
                 files_completed: 0,
                 total_files: 0,
                 bytes_transferred: 0,
@@ -841,6 +934,8 @@ impl P2PClient {
             stop_flag: Arc::new(AtomicBool::new(false)),
             progress: Arc::new(Mutex::new(TransferProgress {
                 current_file: String::new(),
+                mods_completed: 0,
+                total_mods: 0,
                 files_completed: 0,
                 total_files: 0,
                 bytes_transferred: 0,
@@ -947,6 +1042,7 @@ impl P2PClient {
         // Update progress
         {
             let mut progress = self.progress.lock().unwrap();
+            progress.total_mods = pack_info.mods.len();
             progress.total_files = total_files;
             progress.total_bytes = total_bytes;
             progress.status = TransferStatus::Transferring;
@@ -959,7 +1055,6 @@ impl P2PClient {
 
         // Download each file
         let mut files_completed = 0usize;
-        let mut bytes_transferred = 0u64;
 
         for mod_info in &pack_info.mods {
             if self.stop_flag.load(Ordering::SeqCst) {
@@ -967,16 +1062,10 @@ impl P2PClient {
             }
 
             // Download main .pak file
-            let downloaded_bytes =
-                self.download_file(&mut stream, &mod_info.filename, &mod_info.hash, output_dir)?;
-            bytes_transferred += downloaded_bytes;
+            // bytes_transferred is updated per chunk inside download_file
+            self.download_file(&mut stream, &mod_info.filename, &mod_info.hash, output_dir)?;
             files_completed += 1;
-
-            {
-                let mut progress = self.progress.lock().unwrap();
-                progress.files_completed = files_completed;
-                progress.bytes_transferred = bytes_transferred;
-            }
+            self.progress.lock().unwrap().files_completed = files_completed;
 
             // Download IoStore files
             for io_file in &mod_info.iostore_files {
@@ -988,17 +1077,12 @@ impl P2PClient {
                     .filename
                     .replace(".pak", &format!(".{}", io_file.extension));
 
-                let downloaded_bytes =
-                    self.download_file(&mut stream, &io_filename, &io_file.hash, output_dir)?;
-                bytes_transferred += downloaded_bytes;
+                self.download_file(&mut stream, &io_filename, &io_file.hash, output_dir)?;
                 files_completed += 1;
-
-                {
-                    let mut progress = self.progress.lock().unwrap();
-                    progress.files_completed = files_completed;
-                    progress.bytes_transferred = bytes_transferred;
-                }
+                self.progress.lock().unwrap().files_completed = files_completed;
             }
+
+            self.progress.lock().unwrap().mods_completed += 1;
         }
 
         // Send goodbye
@@ -1045,6 +1129,12 @@ impl P2PClient {
 
         // Receive chunks
         loop {
+            if self.stop_flag.load(Ordering::SeqCst) {
+                drop(writer);
+                let _ = fs::remove_file(&output_path);
+                return Err(P2PError::Cancelled);
+            }
+
             let chunk_data = read_encrypted_message(stream, &self.encryption_key)?;
             let msg: P2PMessage = bincode::deserialize(&chunk_data)
                 .map_err(|e| P2PError::ProtocolError(format!("Invalid chunk: {}", e)))?;
@@ -1061,6 +1151,7 @@ impl P2PClient {
                         .write_all(&data)
                         .map_err(|e| P2PError::FileError(format!("Failed to write: {}", e)))?;
                     total_received += data.len() as u64;
+                    self.progress.lock().unwrap().bytes_transferred += data.len() as u64;
 
                     // Send ACK
                     let ack = P2PMessage::Ack;
@@ -1074,6 +1165,9 @@ impl P2PClient {
                     // Clean up partial file
                     drop(writer);
                     let _ = fs::remove_file(&output_path);
+                    if message == HOST_STOPPED_MESSAGE {
+                        return Err(P2PError::HostStopped);
+                    }
                     return Err(P2PError::ProtocolError(message));
                 }
                 _ => {

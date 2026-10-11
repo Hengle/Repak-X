@@ -1286,7 +1286,8 @@ function App() {
         setStatus(`Extracted ${fileCount} assets`)
 
         const modName = (modPath.split(/[/\\]/).pop() || '').replace(/\.[^.]+$/, '')
-        await invoke('open_in_explorer', { path: `${destFolder}\\${modName}` })
+        const separator = destFolder.includes('\\') ? '\\' : '/'
+        await invoke('open_in_explorer', { path: `${destFolder}${separator}${modName}` })
       } finally {
         unlistenProgress()
         setIsModsLoading(false)

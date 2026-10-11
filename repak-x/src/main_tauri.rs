@@ -8117,6 +8117,18 @@ async fn p2p_get_share_session(
         }))
 }
 
+/// Get upload progress for the current share
+#[tauri::command]
+async fn p2p_get_share_progress(
+    p2p_state: State<'_, P2PState>,
+) -> Result<Option<p2p_sharing::UploadProgress>, String> {
+    let shares = p2p_state.manager.active_shares.lock();
+    Ok(shares
+        .values()
+        .next()
+        .and_then(|s| s.upload_progress.lock().ok().map(|p| p.clone())))
+}
+
 /// Check if currently sharing
 #[tauri::command]
 async fn p2p_is_sharing(p2p_state: State<'_, P2PState>) -> Result<bool, String> {
@@ -8286,24 +8298,46 @@ fn register_protocol_handler() -> Result<(), Box<dyn std::error::Error>> {
     let exe_path = std::env::current_exe()?;
     let exe_path_str = exe_path.to_string_lossy();
 
-    // Create the .desktop file content
-    let desktop_content = format!(
-        r#"[Desktop Entry]
+    // Get the applications directory
+    if let Some(home) = dirs::home_dir() {
+        // Nothing installs a themed `repakx` icon, so write the embedded one out and
+        // point the entry at it by absolute path. Fall back to the name if that fails.
+        let icon_dir = home.join(".local/share/icons/hicolor/512x512/apps");
+        let icon_file = icon_dir.join("repakx.png");
+        let icon = match std::fs::create_dir_all(&icon_dir)
+            .and_then(|_| std::fs::write(&icon_file, include_bytes!("../icons/RepakIcon.png")))
+        {
+            Ok(()) => icon_file.to_string_lossy().to_string(),
+            Err(e) => {
+                warn!("Failed to write app icon to {}: {}", icon_file.display(), e);
+                "repakx".to_string()
+            }
+        };
+
+        // StartupWMClass ties the running window (app id = binary name) to this entry,
+        // so the dock and window switcher show the icon too, not just the launcher.
+        let wm_class = exe_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "REPAK-X".to_string());
+
+        // Create the .desktop file content
+        let desktop_content = format!(
+            r#"[Desktop Entry]
 Type=Application
 Name=Repak X
 Comment=Marvel Rivals Mod Manager
 Exec="{}" %u
-Icon=repakx
+Icon={}
 Terminal=false
 Categories=Game;Utility;
 MimeType=x-scheme-handler/repakx;
 StartupNotify=true
+StartupWMClass={}
 "#,
-        exe_path_str
-    );
+            exe_path_str, icon, wm_class
+        );
 
-    // Get the applications directory
-    if let Some(home) = dirs::home_dir() {
         let applications_dir = home.join(".local/share/applications");
         std::fs::create_dir_all(&applications_dir)?;
 
@@ -8699,6 +8733,7 @@ fn main() {
             p2p_stop_sharing,
             p2p_get_share_session,
             p2p_is_sharing,
+            p2p_get_share_progress,
             p2p_start_receiving,
             p2p_stop_receiving,
             p2p_get_receive_progress,

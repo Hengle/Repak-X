@@ -228,6 +228,7 @@ pub struct ActiveShare {
     pub stop_flag: Arc<AtomicBool>,
     pub upnp_external_port: Option<u16>,
     pub bore_task_handle: Option<tokio::task::JoinHandle<()>>,
+    pub upload_progress: Arc<std::sync::Mutex<crate::p2p_sharing::UploadProgress>>,
 }
 
 pub struct ActiveDownload {
@@ -264,6 +265,7 @@ impl UnifiedP2PManager {
         let server = crate::p2p_sharing::P2PServer::new(pack, paths)?;
         let session = server.get_session();
         let stop_flag = server.get_stop_flag();
+        let upload_progress = server.upload_progress_handle();
         let key_bytes = *server.encryption_key_bytes();
         let local_port = session.port;
 
@@ -356,6 +358,7 @@ impl UnifiedP2PManager {
                 stop_flag,
                 upnp_external_port,
                 bore_task_handle,
+                upload_progress,
             },
         );
 
@@ -432,6 +435,8 @@ impl UnifiedP2PManager {
                 share_info: share_info.clone(),
                 progress: TransferProgress {
                     current_file: "Connecting...".into(),
+                    mods_completed: 0,
+                    total_mods: 0,
                     files_completed: 0,
                     total_files: 1,
                     bytes_transferred: 0,
@@ -525,6 +530,7 @@ impl UnifiedP2PManager {
                             if let Some(d) = dl.lock().get_mut(&c) {
                                 d.progress.status = TransferStatus::Completed;
                                 d.progress.files_completed = d.progress.total_files;
+                                d.progress.mods_completed = d.progress.total_mods;
                             }
                             let _ = window.emit("mods_dir_changed", ());
                             return; // success
@@ -533,6 +539,14 @@ impl UnifiedP2PManager {
                             info!("[P2P] Download cancelled by user");
                             if let Some(d) = dl.lock().get_mut(&c) {
                                 d.progress.status = TransferStatus::Cancelled;
+                            }
+                            return;
+                        }
+                        Err(e @ crate::p2p_sharing::P2PError::HostStopped) => {
+                            // No point retrying other addresses - the share is gone
+                            info!("[P2P] Sender stopped sharing");
+                            if let Some(d) = dl.lock().get_mut(&c) {
+                                d.progress.status = TransferStatus::Failed(e.to_string());
                             }
                             return;
                         }
@@ -576,9 +590,20 @@ impl UnifiedP2PManager {
                                 | TransferStatus::Failed(_)
                                 | TransferStatus::Cancelled
                         );
-                        if let Some(d) = dl2.lock().get_mut(&c2) {
-                            d.progress = prog;
+                        let mut downloads = dl2.lock();
+                        let Some(d) = downloads.get_mut(&c2) else {
+                            break; // download was stopped and removed
+                        };
+                        // The download thread sets Failed/Cancelled directly on the
+                        // entry; the client's own handle never reaches those states,
+                        // so don't overwrite a final status with a stale one.
+                        if matches!(
+                            d.progress.status,
+                            TransferStatus::Failed(_) | TransferStatus::Cancelled
+                        ) {
+                            break;
                         }
+                        d.progress = prog;
                         if is_done {
                             break;
                         }

@@ -38,9 +38,26 @@
   font-display: swap;
 }
 
+/* Fallback for platforms without Segoe UI (Linux) */
+@font-face {
+  font-family: 'Inter';
+  src: url('./fonts/Inter/InterVariable.woff2') format('woff2');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Inter';
+  src: url('./fonts/Inter/InterVariable-Italic.woff2') format('woff2');
+  font-weight: 100 900;
+  font-style: italic;
+  font-display: swap;
+}
+
 :root {
   /* Minimal Font Stack - Clean & Modern */
-  --font-primary: 'Segoe UI', system-ui, sans-serif;
+  --font-primary: 'Segoe UI', 'Inter', system-ui, sans-serif;
   --font-mono: 'JetBrains Mono', monospace;
   --font-logo: 'BBH Bartle', sans-serif;
 }

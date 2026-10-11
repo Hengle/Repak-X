@@ -17,7 +17,7 @@
   display: flex;
   justify-content: center;
   align-items: center;
-  font-family: 'Inter', system-ui, sans-serif;
+  font-family: var(--font-primary);
   overflow: hidden;
 }
 

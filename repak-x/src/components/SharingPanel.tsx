@@ -45,12 +45,29 @@ type TransferStatus = 'Connecting' | 'Handshaking' | 'Transferring' | 'Verifying
 
 type TransferProgress = {
   current_file: string;
+  mods_completed: number;
+  total_mods: number;
   files_completed: number;
   total_files: number;
   bytes_transferred: number;
   total_bytes: number;
   status: TransferStatus;
 };
+
+type UploadProgress = {
+  active: boolean;
+  peer_name: string | null;
+  current_file: string;
+  mods_completed: number;
+  total_mods: number;
+  files_completed: number;
+  total_files: number;
+  bytes_transferred: number;
+  total_bytes: number;
+  completed_transfers: number;
+};
+
+type SpeedSample = { bytes: number; time: number };
 
 type FolderRecord = {
   id: string;
@@ -64,6 +81,20 @@ type SharingPanelProps = {
   installedMods: InstalledMod[];
   selectedMods?: Set<string>;
   folders?: FolderRecord[];
+};
+
+const formatBytes = (bytes: number): string => {
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+};
+
+const formatDuration = (seconds: number): string => {
+  const s = Math.ceil(seconds);
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
+  return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
 };
 
 export default function SharingPanel({ onClose, gamePath, installedMods, selectedMods, folders = [] }: SharingPanelProps) {
@@ -89,6 +120,11 @@ export default function SharingPanel({ onClose, gamePath, installedMods, selecte
   const [progress, setProgress] = useState<TransferProgress | null>(null);
   const [receiveComplete, setReceiveComplete] = useState(false);
   const receiveHandledRef = useRef(false);
+  const [transferSpeed, setTransferSpeed] = useState(0); // bytes per second
+  const speedSampleRef = useRef<SpeedSample[]>([]);
+  const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
+  const [uploadSpeed, setUploadSpeed] = useState(0); // bytes per second
+  const uploadSampleRef = useRef<SpeedSample[]>([]);
   const [isValidCode, setIsValidCode] = useState<boolean | null>(null); // null, true, false
   const rootFolder = folders.find(f => f.is_root);
   const [receiveFolderId, setReceiveFolderId] = useState<string | null>(rootFolder?.id ?? null);
@@ -106,7 +142,7 @@ export default function SharingPanel({ onClose, gamePath, installedMods, selecte
   useEffect(() => {
     let interval;
     checkStatus();
-    interval = setInterval(checkStatus, 1000);
+    interval = setInterval(checkStatus, 500);
     return () => clearInterval(interval);
   }, []);
 
@@ -146,6 +182,49 @@ export default function SharingPanel({ onClose, gamePath, installedMods, selecte
     return () => clearTimeout(timeout);
   }, [connectionString]);
 
+  // Data arrives in 1 MB chunks, so on a slow link the byte counter sits still
+  // for seconds and then jumps. Measuring bytes per poll (or per fixed window)
+  // turns that into pulses, so time the jumps instead: a sample is recorded only
+  // when the counter moves, and speed is bytes between the oldest and newest
+  // jump over the time between them.
+  const SPEED_WINDOW_MS = 10000;
+  const updateSpeed = (
+    bytes: number,
+    samplesRef: React.MutableRefObject<SpeedSample[]>,
+    setSpeed: React.Dispatch<React.SetStateAction<number>>,
+  ) => {
+    const now = performance.now();
+    const samples = samplesRef.current;
+    const last = samples[samples.length - 1];
+
+    if (!last || bytes < last.bytes) {
+      // First poll, or a new attempt/transfer started
+      samplesRef.current = [{ bytes, time: now }];
+      setSpeed(0);
+      return;
+    }
+    if (bytes > last.bytes) {
+      samples.push({ bytes, time: now });
+      while (samples.length > 3 && now - samples[1].time >= SPEED_WINDOW_MS) samples.shift();
+    } else if (samples.length === 1) {
+      // Nothing has moved yet: keep the baseline at "now" so time spent
+      // waiting or connecting isn't counted against the first chunk
+      last.time = now;
+    }
+    if (samples.length < 2) return;
+
+    const first = samples[0];
+    const newest = samples[samples.length - 1];
+    const transferred = newest.bytes - first.bytes;
+    const span = newest.time - first.time;
+    const idle = now - newest.time;
+    const expectedGap = span / (samples.length - 1);
+    // If the next jump is overdue the link has slowed or stalled: let the
+    // readout decay instead of holding the old rate
+    const elapsed = idle > expectedGap * 2 + 1000 ? now - first.time : span;
+    setSpeed(transferred / (elapsed / 1000));
+  };
+
   const checkStatus = async () => {
     try {
       const sharing = await invoke('p2p_is_sharing') as any;
@@ -154,6 +233,11 @@ export default function SharingPanel({ onClose, gamePath, installedMods, selecte
       if (sharing) {
         const session = await invoke<ShareInfo | null>('p2p_get_share_session');
         if (session) setShareInfo(session);
+        const upload = await invoke<UploadProgress | null>('p2p_get_share_progress');
+        setUploadProgress(upload);
+        if (upload) updateSpeed(upload.bytes_transferred, uploadSampleRef, setUploadSpeed);
+      } else {
+        setUploadProgress(null);
       }
 
       const receiving = await invoke('p2p_is_receiving') as any;
@@ -163,6 +247,7 @@ export default function SharingPanel({ onClose, gamePath, installedMods, selecte
         const prog = await invoke<TransferProgress | null>('p2p_get_receive_progress');
         if (prog) {
           setProgress(prog);
+          updateSpeed(prog.bytes_transferred, speedSampleRef, setTransferSpeed);
           const isTerminal = prog.status === 'Completed'
             || prog.status === 'Cancelled'
             || (typeof prog.status === 'object' && prog.status !== null && 'Failed' in prog.status);
@@ -177,7 +262,7 @@ export default function SharingPanel({ onClose, gamePath, installedMods, selecte
 
             if (prog.status === 'Completed') {
               setReceiveComplete(true);
-              const count = prog.total_files || prog.files_completed;
+              const count = prog.total_mods || prog.mods_completed;
               alert.success('Receive Complete', count > 0
                 ? `${count} mod${count !== 1 ? 's' : ''} received and installed.`
                 : 'All mods received and installed.');
@@ -361,6 +446,13 @@ export default function SharingPanel({ onClose, gamePath, installedMods, selecte
     setPackPreview(null); // Invalidate preview
   };
 
+  const receiveFraction = progress && progress.total_bytes > 0
+    ? Math.min(progress.bytes_transferred / progress.total_bytes, 1)
+    : 0;
+  const uploadFraction = uploadProgress && uploadProgress.total_bytes > 0
+    ? Math.min(uploadProgress.bytes_transferred / uploadProgress.total_bytes, 1)
+    : 0;
+
   return (
     <div className="p2p-overlay">
       <motion.div
@@ -480,6 +572,7 @@ export default function SharingPanel({ onClose, gamePath, installedMods, selecte
                         <div className={`pack-preview-section ${calculatingPreview ? 'calculating' : ''}`}>
                           <div className="preview-info">
                             <span>Total Size: {packPreview ? `${(packPreview.total_size / 1024 / 1024).toFixed(2)} MB` : '—'}</span>
+                            <span>Mods: {selectedModPaths.size}</span>
                             <span>Files: {packPreview ? packPreview.file_count : '—'}</span>
                           </div>
                         </div>
@@ -530,6 +623,39 @@ export default function SharingPanel({ onClose, gamePath, installedMods, selecte
                       <span className="secure-badge"><SecurityIcon fontSize="inherit" /> AES-256 Encrypted</span>
                     </div>
                   </div>
+
+                  {uploadProgress && (
+                    <div className="progress-container">
+                      <div className="progress-info">
+                        <span>{uploadProgress.active
+                          ? `Sending to ${uploadProgress.peer_name || 'peer'}${uploadProgress.current_file ? ` — ${uploadProgress.current_file}` : '...'}`
+                          : uploadProgress.completed_transfers > 0
+                            ? `Sent to ${uploadProgress.completed_transfers} peer${uploadProgress.completed_transfers !== 1 ? 's' : ''} — waiting for more`
+                            : 'Waiting for a peer to connect...'}</span>
+                        <span>{uploadProgress.active ? `${Math.round(uploadFraction * 100)}%` : ''}</span>
+                      </div>
+                      {uploadProgress.active && (
+                        <>
+                          <div className="progress-bar-track">
+                            <div
+                              className="progress-bar-fill"
+                              style={{ width: `${uploadFraction * 100}%` }}
+                            />
+                          </div>
+                          <div className="progress-stats">
+                            <span>{uploadProgress.mods_completed} / {uploadProgress.total_mods} mods · {uploadProgress.files_completed} / {uploadProgress.total_files} files</span>
+                            <span>{formatBytes(uploadProgress.bytes_transferred)} / {formatBytes(uploadProgress.total_bytes)}</span>
+                          </div>
+                          <div className="progress-stats">
+                            <span>{uploadSpeed > 0 ? `${formatBytes(uploadSpeed)}/s` : 'Measuring speed...'}</span>
+                            <span>{uploadSpeed > 0 && uploadProgress.total_bytes > uploadProgress.bytes_transferred
+                              ? `${formatDuration((uploadProgress.total_bytes - uploadProgress.bytes_transferred) / uploadSpeed)} left`
+                              : ''}</span>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  )}
 
                   <button onClick={handleStopSharing} className="btn-danger btn-large">
                     <WifiOffIcon /> Stop Sharing
@@ -651,18 +777,28 @@ export default function SharingPanel({ onClose, gamePath, installedMods, selecte
                             <span>{progress.status === 'Transferring' || progress.status === 'Verifying'
                               ? (progress.current_file.split(/[/\\]/).pop() || progress.current_file)
                               : ''}</span>
-                            <span>{progress.total_files > 0 ? `${Math.round((progress.files_completed / progress.total_files) * 100)}%` : '—'}</span>
+                            <span>{progress.total_bytes > 0 ? `${Math.round(receiveFraction * 100)}%` : '—'}</span>
                           </div>
                           <div className="progress-bar-track">
                             <div
                               className="progress-bar-fill"
-                              style={{ width: progress.total_files > 0 ? `${(progress.files_completed / progress.total_files) * 100}%` : '0%' }}
+                              style={{ width: `${receiveFraction * 100}%` }}
                             />
                           </div>
                           <div className="progress-stats">
-                            <span>{progress.total_files > 0 ? `${progress.files_completed} / ${progress.total_files} files` : 'Waiting for file list...'}</span>
-                            <span>{(progress.bytes_transferred / 1024 / 1024).toFixed(1)} MB transferred</span>
+                            <span>{progress.total_bytes > 0 ? `${progress.mods_completed} / ${progress.total_mods} mods · ${progress.files_completed} / ${progress.total_files} files` : 'Waiting for file list...'}</span>
+                            <span>{progress.total_bytes > 0
+                              ? `${formatBytes(progress.bytes_transferred)} / ${formatBytes(progress.total_bytes)}`
+                              : `${formatBytes(progress.bytes_transferred)} transferred`}</span>
                           </div>
+                          {progress.status === 'Transferring' && (
+                            <div className="progress-stats">
+                              <span>{transferSpeed > 0 ? `${formatBytes(transferSpeed)}/s` : 'Measuring speed...'}</span>
+                              <span>{transferSpeed > 0 && progress.total_bytes > progress.bytes_transferred
+                                ? `${formatDuration((progress.total_bytes - progress.bytes_transferred) / transferSpeed)} left`
+                                : ''}</span>
+                            </div>
+                          )}
                           <div className="status-badge">
                             {typeof progress.status === 'string' ? progress.status : (progress.status as { Failed: string }).Failed}
                           </div>

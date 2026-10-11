@@ -264,6 +264,8 @@ export default function SettingsPanel({ settings, onSave, onClose, theme, setThe
                         </span>
                         <div className="setting-toggle-actions">
                           <span style={{
+                            position: 'relative',
+                            top: '-3px',
                             fontSize: '0.85rem',
                             opacity: parallelProcessing ? 1 : 0.8,
                             fontWeight: parallelProcessing ? '900' : '500',
