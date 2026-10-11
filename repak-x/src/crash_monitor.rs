@@ -36,31 +36,33 @@ pub fn get_crash_log_path() -> PathBuf {
     {
         // Marvel Rivals on Linux runs via Steam Proton
         // Crash logs are in the Proton prefix for the game (AppID: 2767030)
+        const PREFIX: &str = "steamapps/compatdata/2767030";
+        const CRASHES: &str = "pfx/drive_c/users/steamuser/AppData/Local/Marvel/Saved/Crashes";
+
+        // The prefix lives in whichever Steam library holds the game, which may be on
+        // another drive, so check every library Steam knows about before the usual roots.
+        let mut candidates = crate::utils::get_steam_library_paths();
+        candidates.extend(crate::utils::linux_steam_roots());
         if let Some(home) = dirs::home_dir() {
-            // Try common Steam library locations
-            let steam_paths = [
-                home.join(".steam/steam"),
-                home.join(".local/share/Steam"),
-                home.join("SteamLibrary"),
-            ];
-
-            for steam_path in &steam_paths {
-                let crash_path = steam_path
-                    .join("steamapps/compatdata/2767030/pfx/drive_c/users/steamuser/AppData/Local/Marvel/Saved/Crashes");
-                if crash_path.exists() {
-                    return crash_path;
-                }
-            }
-
-            // Default to first path even if it doesn't exist yet
-            return steam_paths[0]
-                .join("steamapps/compatdata/2767030/pfx/drive_c/users/steamuser/AppData/Local/Marvel/Saved/Crashes");
+            candidates.push(home.join("SteamLibrary"));
         }
 
-        // Fallback if home dir not found
-        PathBuf::from("/home")
-            .join(std::env::var("USER").unwrap_or_else(|_| "user".to_string()))
-            .join(".steam/steam/steamapps/compatdata/2767030/pfx/drive_c/users/steamuser/AppData/Local/Marvel/Saved/Crashes")
+        // A prefix without a Crashes folder just means the game has not crashed yet.
+        if let Some(lib) = candidates.iter().find(|lib| lib.join(PREFIX).exists()) {
+            return lib.join(PREFIX).join(CRASHES);
+        }
+
+        // Default to the first candidate even if it doesn't exist yet
+        candidates
+            .first()
+            .cloned()
+            .unwrap_or_else(|| {
+                PathBuf::from("/home")
+                    .join(std::env::var("USER").unwrap_or_else(|_| "user".to_string()))
+                    .join(".steam/steam")
+            })
+            .join(PREFIX)
+            .join(CRASHES)
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]

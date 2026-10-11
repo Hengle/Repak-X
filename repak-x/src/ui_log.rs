@@ -150,16 +150,37 @@ pub fn get_ui_log_backlog() -> Vec<UiLogPayload> {
 // LOG EXPORT
 // ============================================================================
 
-/// Where log files live: next to the executable, matching `setup_logging()`.
-fn log_dir() -> std::path::PathBuf {
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            return exe_dir.join("Logs");
-        }
+/// True when `dir` can be created and written to.
+fn is_writable_dir(dir: &std::path::Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
     }
-    dirs::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("Repak-X")
+    let probe = dir.join(".write_test");
+    let ok = std::fs::File::create(&probe).is_ok();
+    let _ = std::fs::remove_file(&probe);
+    ok
+}
+
+/// Where log files live: next to the executable when that folder is writable (the
+/// portable layout), otherwise under the app's config directory. An installed build
+/// (/usr/bin, AppImage) sits in a read-only location, so it takes the second path.
+/// Resolved once so every caller agrees on the same folder for the whole run.
+pub fn log_dir() -> std::path::PathBuf {
+    static LOG_DIR: Lazy<std::path::PathBuf> = Lazy::new(|| {
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(exe_dir) = exe_path.parent() {
+                let dir = exe_dir.join("Logs");
+                if is_writable_dir(&dir) {
+                    return dir;
+                }
+            }
+        }
+        dirs::config_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("Repak-X")
+            .join("Logs")
+    });
+    LOG_DIR.clone()
 }
 
 /// Full path of the rolling application log, so the UI can offer to open it.

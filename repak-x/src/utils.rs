@@ -458,9 +458,28 @@ pub fn find_marvel_rivals() -> Option<PathBuf> {
     None
 }
 
+/// Steam installation roots on Linux: native package, Flatpak and Snap.
+#[cfg(target_os = "linux")]
+pub fn linux_steam_roots() -> Vec<PathBuf> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    [
+        ".steam/steam",
+        ".local/share/Steam",
+        ".var/app/com.valvesoftware.Steam/.local/share/Steam",
+        ".var/app/com.valvesoftware.Steam/.steam/steam",
+        "snap/steam/common/.local/share/Steam",
+        "snap/steam/common/.steam/steam",
+    ]
+    .iter()
+    .map(|p| home.join(p))
+    .collect()
+}
+
 /// Reads `libraryfolders.vdf` to find additional Steam libraries.
 /// Enhanced to check registry and multiple common locations.
-fn get_steam_library_paths() -> Vec<PathBuf> {
+pub fn get_steam_library_paths() -> Vec<PathBuf> {
     let mut vdf_paths_to_check: Vec<PathBuf> = Vec::new();
 
     #[cfg(target_os = "windows")]
@@ -495,37 +514,40 @@ fn get_steam_library_paths() -> Vec<PathBuf> {
 
     #[cfg(target_os = "linux")]
     {
-        // Expand home directory properly
-        if let Some(home) = dirs::home_dir() {
-            vdf_paths_to_check.push(home.join(".steam/steam/steamapps/libraryfolders.vdf"));
-            vdf_paths_to_check.push(home.join(".local/share/Steam/steamapps/libraryfolders.vdf"));
+        for root in linux_steam_roots() {
+            vdf_paths_to_check.push(root.join("steamapps/libraryfolders.vdf"));
         }
     }
 
-    // Find first existing VDF file
-    let vdf_path = vdf_paths_to_check.into_iter().find(|p| p.exists());
+    // Read every VDF that exists: native, Flatpak and Snap Steam can be installed side
+    // by side on Linux, each with its own library list.
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut found_vdf = false;
 
-    let Some(vdf_path) = vdf_path else {
-        info!("No Steam libraryfolders.vdf found");
-        return vec![];
-    };
+    for vdf_path in vdf_paths_to_check.into_iter().filter(|p| p.exists()) {
+        found_vdf = true;
+        info!("Using Steam library config: {:?}", vdf_path);
 
-    info!("Using Steam library config: {:?}", vdf_path);
+        let content = fs::read_to_string(&vdf_path).ok().unwrap_or_default();
 
-    let content = fs::read_to_string(&vdf_path).ok().unwrap_or_default();
-    let mut paths = Vec::new();
-
-    for line in content.lines() {
-        if line.trim().starts_with("\"path\"") {
-            let path = line
-                .split("\"")
-                .nth(3)
-                .map(|s| PathBuf::from(s.replace("\\\\", "\\")));
-            info!("Found steam library path: {:?}", path);
-            if let Some(p) = path {
-                paths.push(p);
+        for line in content.lines() {
+            if line.trim().starts_with("\"path\"") {
+                let path = line
+                    .split("\"")
+                    .nth(3)
+                    .map(|s| PathBuf::from(s.replace("\\\\", "\\")));
+                info!("Found steam library path: {:?}", path);
+                if let Some(p) = path {
+                    if !paths.contains(&p) {
+                        paths.push(p);
+                    }
+                }
             }
         }
+    }
+
+    if !found_vdf {
+        info!("No Steam libraryfolders.vdf found");
     }
 
     paths

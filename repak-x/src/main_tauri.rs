@@ -7130,15 +7130,9 @@ fn app_dir() -> PathBuf {
         .join("Repak-X")
 }
 
-/// Directory for log files - placed next to the executable for easy access
+/// Directory for log files - next to the executable when writable, else the config dir
 fn log_dir() -> PathBuf {
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            return exe_dir.join("Logs");
-        }
-    }
-    // Fallback to config-based app_dir if current_exe fails
-    app_dir()
+    ui_log::log_dir()
 }
 
 fn save_state(state: &AppState) -> std::io::Result<()> {
@@ -7201,7 +7195,6 @@ fn emit_session_banner(app: &tauri::App) {
 }
 
 fn setup_logging() {
-    // Try exe-relative Logs folder first
     let log_dir = log_dir();
     let log_file = log_dir.join("repakx.log");
 
@@ -8449,21 +8442,21 @@ fn main() {
                     println!("Successfully removed old uassettool folder");
                 }
             }
-
-            let log_dir = exe_dir.join("Logs");
-            if let Err(e) = std::fs::create_dir_all(&log_dir) {
-                eprintln!("Failed to create log directory {:?}: {}", log_dir, e);
-            } else {
-                let startup_log = log_dir.join("startup.log");
-                let _ = std::fs::write(
-                    &startup_log,
-                    format!(
-                        "RepakX (Tauri) startup at {:?}\n",
-                        std::time::SystemTime::now()
-                    ),
-                );
-            }
         }
+    }
+
+    let log_dir = log_dir();
+    if let Err(e) = std::fs::create_dir_all(&log_dir) {
+        eprintln!("Failed to create log directory {:?}: {}", log_dir, e);
+    } else {
+        let startup_log = log_dir.join("startup.log");
+        let _ = std::fs::write(
+            &startup_log,
+            format!(
+                "RepakX (Tauri) startup at {:?}\n",
+                std::time::SystemTime::now()
+            ),
+        );
     }
 
     setup_logging();

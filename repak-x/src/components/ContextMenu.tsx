@@ -208,7 +208,7 @@ const ContextMenu = ({ x, y, mod, folder, onClose, onAssignTag, onNewTag, onMove
         <div className="context-menu-item" onClick={async () => {
           onClose();
           try {
-            await invoke('copy_to_clipboard', { text: gamePath || folder.id });
+            await navigator.clipboard.writeText(gamePath || folder.id);
           } catch (e) {
             console.error('Failed to copy folder path:', e);
           }
@@ -260,7 +260,7 @@ const ContextMenu = ({ x, y, mod, folder, onClose, onAssignTag, onNewTag, onMove
             // Construct full folder path from gamePath + folder.id
             const separator = gamePath?.includes('\\') ? '\\' : '/';
             const fullPath = gamePath && folder.id ? `${gamePath}${separator}${folder.id}` : folder.id;
-            await invoke('copy_to_clipboard', { text: fullPath });
+            await navigator.clipboard.writeText(fullPath);
           } catch (e) {
             console.error('Failed to copy folder path:', e);
           }
@@ -447,7 +447,7 @@ const ContextMenu = ({ x, y, mod, folder, onClose, onAssignTag, onNewTag, onMove
       </div>
       <div className="context-menu-item" onClick={async () => {
         try {
-          await invoke('copy_to_clipboard', { text: mod.path });
+          await navigator.clipboard.writeText(mod.path);
         } catch (e) {
           console.error('Failed to copy path:', e);
         }
